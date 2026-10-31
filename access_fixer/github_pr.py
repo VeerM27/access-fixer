@@ -15,6 +15,8 @@ from .fix.result import FixResult
 GITHUB_MCP_URL = "https://api.githubcopilot.com/mcp/"
 PR_TOOLS = ["create_branch", "push_files", "create_pull_request"]
 PR_URL = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+# The create call may only give the API URL (".../pulls/1") or the number.
+PR_NUMBER = re.compile(r"/pulls?/(\d+)|\"number\":\s*(\d+)")
 
 
 class PullRequestError(Exception):
@@ -101,7 +103,7 @@ def _result_text(result: object) -> str:
     if isinstance(result, dict):
         parts = result.get("content") or []
         text = " ".join(p.get("text", "") for p in parts if isinstance(p, dict))
-        if result.get("isError"):
+        if result.get("isError") or result.get("is_error"):
             raise PullRequestError(text[:300] or "GitHub MCP tool failed.")
         return text
     return str(result)
@@ -134,7 +136,17 @@ async def open_pull_request(result: FixResult, ctx: Context) -> str:
     finally:
         await toolset.close()
 
-    match = PR_URL.search(text)
-    if not match:
-        raise PullRequestError("The pull request was created but no link came back.")
-    return match.group(0)
+    url = pr_url(text, source.owner, source.repo)
+    if url is None:
+        raise PullRequestError(
+            f"The pull request was created from {branch} but no link came back."
+        )
+    return url
+
+
+def pr_url(text: str, owner: str | None, repo: str | None) -> str | None:
+    if match := PR_URL.search(text):
+        return match.group(0)
+    if match := PR_NUMBER.search(text):
+        return f"https://github.com/{owner}/{repo}/pull/{match.group(1) or match.group(2)}"
+    return None

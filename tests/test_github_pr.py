@@ -3,7 +3,13 @@ from datetime import UTC, datetime
 from access_fixer.audit.score import AuditSummary
 from access_fixer.fix.edits import Edit, EditOutcome
 from access_fixer.fix.result import FixResult
-from access_fixer.github_pr import branch_name, changed_files_payload, pr_body, pr_title
+from access_fixer.github_pr import (
+    branch_name,
+    changed_files_payload,
+    pr_body,
+    pr_title,
+    pr_url,
+)
 from access_fixer.source import Source
 
 
@@ -47,3 +53,11 @@ def test_title_branch_and_files(tmp_path):
     now = datetime(2026, 10, 31, 9, 5, 0, tzinfo=UTC)
     assert branch_name(now) == "access-fixer/20261031-090500"
     assert changed_files_payload(result) == [{"path": "index.html", "content": '<img alt="Logo">'}]
+
+
+def test_pr_url_from_any_reply_shape():
+    html = "https://github.com/o/r/pull/4"
+    assert pr_url(f'{{"url": "{html}"}}', "o", "r") == html
+    assert pr_url('{"url": "https://api.github.com/repos/o/r/pulls/4"}', "o", "r") == html
+    assert pr_url('{"id": "123", "number": 4}', "o", "r") == html
+    assert pr_url('{"id": "123"}', "o", "r") is None
