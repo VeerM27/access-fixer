@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DEFAULT_MODEL = "gemini-3.6-flash"
-DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash"
+DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash-lite"
 
 
 @dataclass(frozen=True)
