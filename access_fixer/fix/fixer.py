@@ -12,7 +12,7 @@ from .edits import Edit
 
 # Backs off on rate limits and server errors; other 4xx errors fail fast.
 RETRY = types.HttpRetryOptions(
-    attempts=4, initial_delay=2, max_delay=30, http_status_codes=[429, 500, 502, 503, 504]
+    attempts=6, initial_delay=2, max_delay=60, http_status_codes=[429, 500, 502, 503, 504]
 )
 
 # Tokens used per invocation, read by the fix loop for its log lines.
@@ -39,8 +39,13 @@ Rules:
   Use alt="" only for purely decorative images.
 - label, select-name, button-name, link-name: add visible text or an aria-label that says
   what the control does.
-- Fix every listed failing element. Several edits may target the same file, but their
+- document-title: add a short, specific title element inside head.
+- html-has-lang: add lang="en" (or the page's language) to the html tag.
+- autocomplete-valid: use a valid token, e.g. tel instead of phone-number.
+- Go through every page in the failing list, the last one as carefully as the first, and
+  fix every listed failing element. Several edits may target the same file, but their
   find texts must not overlap.
+- rule_id is always the id of the failing rule the edit fixes.
 """
 
 

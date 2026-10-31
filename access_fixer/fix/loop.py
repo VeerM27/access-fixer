@@ -1,5 +1,6 @@
 """One fix round: apply edits, re-audit, and revert anything that made a page worse."""
 
+import re
 from collections import Counter
 from html.parser import HTMLParser
 from pathlib import Path
@@ -11,7 +12,8 @@ from ..audit.pages import find_pages
 from .edits import Edit, EditOutcome, apply_edits, revert
 from .prompt import linked_css
 
-VAGUE_LINK_TEXT = {"click here", "here", "read more", "more", "learn more", "link"}
+ALT_TEXT = re.compile(r'alt="([^"]+)"')
+VAGUE_LINK_TEXT ={"click here", "here", "read more", "more", "learn more", "link"}
 
 
 class RoundResult(BaseModel):
@@ -97,6 +99,6 @@ def manual_checks(root: Path, accepted: list[EditOutcome]) -> list[str]:
                 checks.append(f'{page}: link text "{text}" is vague, say where it goes')
     for outcome in accepted:
         if outcome.edit.rule_id == "image-alt":
-            edit = outcome.edit
-            checks.append(f"{edit.file}: suggested alt text, please check: {edit.replace}")
+            for alt in ALT_TEXT.findall(outcome.edit.replace):
+                checks.append(f'{outcome.edit.file}: suggested alt text, please check: "{alt}"')
     return checks
