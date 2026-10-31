@@ -1,17 +1,44 @@
-"""The Access Fixer workflow: read the site location, audit it, report the results."""
+"""The Access Fixer workflow: read the site location, fix it on a copy, report the results."""
 
+import json
+import logging
 import re
+from collections import Counter
 from pathlib import Path
 
-from google.adk import Event, Workflow
+from google.adk import Context, Event, Workflow
+from google.adk.workflow import node
 from google.genai import types
+from pydantic import BaseModel, ValidationError
 
 from .audit.axe_runner import audit_site
 from .audit.pages import find_pages
 from .audit.score import AuditSummary, summarize
 from .config import load_settings
+from .fix import fixer
+from .fix.edits import Edit, EditOutcome
+from .fix.loop import manual_checks, run_round
+from .fix.prompt import build_fixer_prompt
+from .fix.workspace import make_working_copy
 
 GITHUB_URL = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+/?$")
+MAX_ROUNDS = 2
+
+log = logging.getLogger("access_fixer")
+
+
+class FixResult(BaseModel):
+    original_root: str
+    copy_root: str
+    before: AuditSummary
+    after: AuditSummary
+    rule_counts_before: dict[str, int]
+    rule_counts_after: dict[str, int]
+    accepted: list[EditOutcome]
+    rejected: list[EditOutcome]
+    manual_checks: list[str]
+    changed_files: list[str]
+    rounds: int
 
 
 def _message_text(node_input: types.Content | str) -> str:
@@ -33,36 +60,118 @@ def read_source(node_input: types.Content | str) -> Event:
     return Event(route="ok", output=str(root))
 
 
-async def run_audit(node_input: str) -> Event:
-    root = Path(node_input)
-    pages = find_pages(root)
-    summary = summarize(await audit_site(root, pages))
-    return Event(output=summary, state={"site_root": str(root), "audit": summary.model_dump()})
+def _rule_counts(audits) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for audit in audits:
+        for rule in audit.violations:
+            counts[rule.id] += len(rule.nodes)
+    return counts
 
 
-def format_report(summary: AuditSummary) -> str:
-    impacts = ", ".join(f"{name} {count}" for name, count in summary.by_impact.items() if count)
-    top = "\n".join(f"- `{rule}`: {count}" for rule, count in summary.top_rules)
-    advisories = ", ".join(f"`{rule}` {count}" for rule, count in summary.advisories.items())
-    review = ", ".join(f"`{rule}` {count}" for rule, count in summary.needs_review.items())
-    return (
-        f"**{summary.failing_nodes} failing elements** across {summary.pages} pages "
-        f"(WCAG 2.2 AA by axe). Score {summary.score}/100.\n\n"
-        f"By impact: {impacts or 'none'}\n\nTop rules:\n{top or '- none'}\n\n"
-        f"Advisories (not scored): {advisories or 'none'}\n\n"
-        f"Needs review: {review or 'none'}"
+def _parse_edits(raw: list | None) -> list[Edit]:
+    edits = []
+    for item in raw or []:
+        try:
+            edits.append(Edit.model_validate(item))
+        except ValidationError:
+            continue
+    return edits
+
+
+@node(rerun_on_resume=True)
+async def fix_pipeline(ctx: Context, node_input: str) -> FixResult:
+    original = Path(node_input)
+    copy_root = make_working_copy(original)
+    audits = await audit_site(copy_root, find_pages(copy_root))
+    before_audits = audits
+    accepted: list[EditOutcome] = []
+    rejected: list[EditOutcome] = []
+
+    rounds = 0
+    while rounds < MAX_ROUNDS and _rule_counts(audits):
+        rounds += 1
+        usage_before = Counter(fixer.TOKEN_USAGE[ctx.invocation_id])
+        raw = await ctx.run_node(fixer.fixer_agent, build_fixer_prompt(copy_root, audits))
+        failing_before = sum(_rule_counts(audits).values())
+        result = await run_round(copy_root, audits, _parse_edits(raw))
+        audits = result.audits
+        accepted += result.accepted
+        rejected += result.rejected
+        tokens = fixer.TOKEN_USAGE[ctx.invocation_id] - usage_before
+        log.info(json.dumps({
+            "event": "fix_round",
+            "round": rounds,
+            "prompt_tokens": tokens["prompt_tokens"],
+            "output_tokens": tokens["output_tokens"],
+            "total_tokens": tokens["total_tokens"],
+            "accepted": len(result.accepted),
+            "rejected": len(result.rejected),
+            "failing_before": failing_before,
+            "failing_after": sum(_rule_counts(audits).values()),
+        }))
+
+    return FixResult(
+        original_root=str(original),
+        copy_root=str(copy_root),
+        before=summarize(before_audits),
+        after=summarize(audits),
+        rule_counts_before=dict(_rule_counts(before_audits)),
+        rule_counts_after=dict(_rule_counts(audits)),
+        accepted=accepted,
+        rejected=rejected,
+        manual_checks=manual_checks(copy_root, accepted),
+        changed_files=sorted({outcome.edit.file for outcome in accepted}),
+        rounds=rounds,
     )
 
 
-def report(node_input: AuditSummary) -> Event:
-    return Event(message=format_report(node_input), output=node_input)
+def format_report(result: FixResult) -> str:
+    before, after = result.before, result.after
+    drop = 100 * (before.failing_nodes - after.failing_nodes) / max(before.failing_nodes, 1)
+    by_rule = Counter(outcome.edit.rule_id for outcome in result.accepted)
+    worse = [
+        rule for rule, count in result.rule_counts_after.items()
+        if count > result.rule_counts_before.get(rule, 0)
+    ]
+    lines = [
+        f"**Failures {before.failing_nodes} → {after.failing_nodes}** ({drop:.0f}% fewer) "
+        f"in {result.rounds} round(s). Score {before.score} → {after.score}.",
+        "",
+        "Accepted edits by rule: "
+        + (", ".join(f"`{rule}` {n}" for rule, n in by_rule.most_common()) or "none"),
+        f"Rules that got worse: {', '.join(worse) or 'none'}",
+        "Still failing: "
+        + (", ".join(f"`{rule}` {n}" for rule, n in result.rule_counts_after.items()) or "none"),
+        "",
+        f"Rejected edits ({len(result.rejected)}):",
+        *[f"- {o.edit.file} `{o.edit.rule_id}`: {o.reason}" for o in result.rejected],
+        "",
+        "Manual checks:",
+        *[f"- {check}" for check in result.manual_checks or ["none"]],
+        "",
+        f"Changed files: {', '.join(result.changed_files) or 'none'}",
+    ]
+    return "\n".join(lines)
+
+
+def report(node_input: FixResult) -> Event:
+    return Event(
+        message=format_report(node_input),
+        output=node_input,
+        state={
+            "original_root": node_input.original_root,
+            "copy_root": node_input.copy_root,
+            "edits": [outcome.edit.model_dump() for outcome in node_input.accepted],
+            "changed_files": node_input.changed_files,
+        },
+    )
 
 
 root_agent = Workflow(
     name="access_fixer",
     edges=[
         ("START", read_source),
-        (read_source, {"ok": run_audit}),
-        (run_audit, report),
+        (read_source, {"ok": fix_pipeline}),
+        (fix_pipeline, report),
     ],
 )
