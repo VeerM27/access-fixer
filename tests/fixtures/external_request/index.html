@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>External request fixture</title>
+</head>
+<body>
+  <main>
+    <h1>Calls home</h1>
+    <img src="https://example.com/x.png" alt="logo" width="40" height="40">
+    <script>fetch("https://example.com/beacon").catch(() => {});</script>
+  </main>
+</body>
+</html>

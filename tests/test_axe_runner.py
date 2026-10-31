@@ -13,3 +13,11 @@ async def test_finds_known_fixture_failures():
     assert {"image-alt", "label", "button-name", "color-contrast", "link-name"} <= failing
     assert "html-has-lang" in failing
     assert all(audit.passes for audit in audits)
+
+
+async def test_blocks_requests_to_other_sites():
+    site = Path(__file__).parent / "fixtures" / "external_request"
+    [audit] = await audit_site(site, ["index.html"])
+
+    assert any(url.startswith("https://example.com/") for url in audit.blocked_requests)
+    assert audit.passes

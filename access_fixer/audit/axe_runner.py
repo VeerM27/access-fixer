@@ -38,6 +38,7 @@ class PageAudit(BaseModel):
     passes: list[RuleResult]
     incomplete: list[RuleResult]
     advisories: list[RuleResult]
+    blocked_requests: list[str] = []
 
 
 def _rules(raw_rules: list[dict]) -> list[RuleResult]:
@@ -71,12 +72,14 @@ async def audit_site(root: Path, pages: list[str]) -> list[PageAudit]:
     audits = []
     with serve_folder(root) as base_url:
         local_origin = _origin(base_url)
+        blocked: list[str] = []
 
         async def only_local(route: Route) -> None:
             # Page content is untrusted: never let it reach anything but our own server.
             if _origin(route.request.url) == local_origin:
                 await route.continue_()
             else:
+                blocked.append(route.request.url)
                 await route.abort()
 
         async with async_playwright() as playwright:
@@ -85,6 +88,7 @@ async def audit_site(root: Path, pages: list[str]) -> list[PageAudit]:
             await context.route("**/*", only_local)
             page = await context.new_page()
             for path in pages:
+                blocked.clear()
                 await page.goto(f"{base_url}/{path}", wait_until="load")
                 wcag = (await axe.run(page, options=WCAG_OPTIONS)).response
                 advisory = (await axe.run(page, options=ADVISORY_OPTIONS)).response
@@ -95,6 +99,7 @@ async def audit_site(root: Path, pages: list[str]) -> list[PageAudit]:
                         passes=_rules(wcag["passes"]),
                         incomplete=_rules(wcag["incomplete"]),
                         advisories=_rules(advisory["violations"]),
+                        blocked_requests=list(blocked),
                     )
                 )
             await browser.close()
