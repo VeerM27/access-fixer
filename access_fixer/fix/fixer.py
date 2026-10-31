@@ -1,22 +1,55 @@
 """The one LLM step: an agent that turns failing rules into find/replace edits."""
 
+import json
+import logging
 from collections import Counter, defaultdict
+from collections.abc import AsyncGenerator
 
 from google.adk import Agent
 from google.adk.agents.callback_context import CallbackContext
-from google.adk.models import Gemini, LlmResponse
-from google.genai import types
+from google.adk.models import Gemini, LlmRequest, LlmResponse
+from google.genai import errors, types
 
 from ..config import load_settings
 from .edits import Edit
 
-# Backs off on rate limits and server errors; other 4xx errors fail fast.
+# Backs off on server errors. A 429 is not retried here: on the free tier it usually means
+# the daily quota is gone, so FallbackGemini switches model straight away instead.
 RETRY = types.HttpRetryOptions(
-    attempts=6, initial_delay=2, max_delay=60, http_status_codes=[429, 500, 502, 503, 504]
+    attempts=6, initial_delay=2, max_delay=60, http_status_codes=[500, 502, 503, 504]
 )
+# 503: still overloaded after all retries. 429: out of quota.
+FALLBACK_CODES = (429, 503)
 
-# Tokens used per invocation, read by the fix loop for its log lines.
+log = logging.getLogger("access_fixer")
+
+# Tokens and the last model used, per invocation, read by the fix loop for its log lines.
 TOKEN_USAGE: defaultdict[str, Counter[str]] = defaultdict(Counter)
+MODEL_USED: dict[str, str] = {}
+
+
+class FallbackGemini(Gemini):
+    """Gemini that retries a request once on `fallback_model` if the main model is
+    overloaded or out of quota. Doing it here keeps the error out of the workflow."""
+
+    fallback_model: str
+
+    async def generate_content_async(
+        self, llm_request: LlmRequest, stream: bool = False
+    ) -> AsyncGenerator[LlmResponse, None]:
+        backup = llm_request.model_copy(deep=True)
+        try:
+            async for response in super().generate_content_async(llm_request, stream):
+                yield response
+        except errors.APIError as error:
+            if error.code not in FALLBACK_CODES:
+                raise
+            log.warning(json.dumps({
+                "event": "fixer_fallback", "model": self.fallback_model, "code": error.code,
+            }))
+            backup.model = self.fallback_model
+            async for response in super().generate_content_async(backup, stream):
+                yield response
 
 # No curly braces in here: ADK would treat them as state placeholders.
 INSTRUCTION = """\
@@ -53,22 +86,21 @@ def record_usage(callback_context: CallbackContext, llm_response: LlmResponse) -
     usage = llm_response.usage_metadata
     if usage is None:
         return
+    if llm_response.model_version:
+        MODEL_USED[callback_context.invocation_id] = llm_response.model_version
     counter = TOKEN_USAGE[callback_context.invocation_id]
     counter["prompt_tokens"] += usage.prompt_token_count or 0
     counter["output_tokens"] += usage.candidates_token_count or 0
     counter["total_tokens"] += usage.total_token_count or 0
 
 
-def build_fixer_agent(name: str, model: str) -> Agent:
-    return Agent(
-        name=name,
-        model=Gemini(model=model, retry_options=RETRY),
-        instruction=INSTRUCTION,
-        output_schema=list[Edit],
-        after_model_callback=record_usage,
-    )
-
-
 _settings = load_settings()
-fixer_agent = build_fixer_agent("fixer", _settings.model)
-fallback_fixer_agent = build_fixer_agent("fixer_fallback", _settings.fallback_model)
+fixer_agent = Agent(
+    name="fixer",
+    model=FallbackGemini(
+        model=_settings.model, fallback_model=_settings.fallback_model, retry_options=RETRY
+    ),
+    instruction=INSTRUCTION,
+    output_schema=list[Edit],
+    after_model_callback=record_usage,
+)

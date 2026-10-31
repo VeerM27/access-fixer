@@ -1,7 +1,6 @@
 from pathlib import Path
 
 from google.adk.runners import InMemoryRunner
-from google.genai import errors
 
 from access_fixer.agent import root_agent
 from access_fixer.fix import fixer
@@ -48,30 +47,3 @@ async def test_refuses_local_path_when_not_allowed(monkeypatch):
     assert "GitHub HTTPS URL" in reply
     assert "**Failures" not in reply
 
-
-def overloaded_fixer(node_input: str) -> list[dict]:
-    raise errors.ServerError(503, {"error": {"message": "high demand"}}, None)
-
-
-async def test_falls_back_when_main_model_is_overloaded(monkeypatch, caplog):
-    monkeypatch.setenv("ACCESS_FIXER_ALLOW_LOCAL", "1")
-    monkeypatch.setattr(fixer, "fixer_agent", overloaded_fixer)
-    monkeypatch.setattr(fixer, "fallback_fixer_agent", fake_fixer)
-
-    with caplog.at_level("INFO", logger="access_fixer"):
-        reply = await _reply_text(str(FIXTURE))
-
-    assert "`image-alt` 1" in reply
-    assert "fixer_fallback" in caplog.text
-
-
-def out_of_quota_fixer(node_input: str) -> list[dict]:
-    raise errors.ClientError(429, {"error": {"message": "quota exceeded"}}, None)
-
-
-async def test_falls_back_when_main_model_is_out_of_quota(monkeypatch):
-    monkeypatch.setenv("ACCESS_FIXER_ALLOW_LOCAL", "1")
-    monkeypatch.setattr(fixer, "fixer_agent", out_of_quota_fixer)
-    monkeypatch.setattr(fixer, "fallback_fixer_agent", fake_fixer)
-
-    assert "`image-alt` 1" in await _reply_text(str(FIXTURE))

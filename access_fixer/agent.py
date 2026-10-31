@@ -8,7 +8,7 @@ from pathlib import Path
 
 from google.adk import Context, Event, Workflow
 from google.adk.workflow import node
-from google.genai import errors, types
+from google.genai import types
 from pydantic import BaseModel, ValidationError
 
 from .audit.axe_runner import audit_site
@@ -23,8 +23,6 @@ from .fix.workspace import make_working_copy
 
 GITHUB_URL = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+/?$")
 MAX_ROUNDS = 2
-# 503: overloaded after all retries. 429: quota used up (free tier is 20 requests/day).
-FALLBACK_CODES = (429, 503)
 
 log = logging.getLogger("access_fixer")
 
@@ -80,22 +78,6 @@ def _parse_edits(raw: list | None) -> list[Edit]:
     return edits
 
 
-async def _ask_fixer(ctx: Context, prompt: str) -> tuple[list | None, str]:
-    """Run the fixer; if the main model is overloaded or out of quota, use the fallback."""
-    settings = load_settings()
-    try:
-        return await ctx.run_node(fixer.fixer_agent, prompt), settings.model
-    except Exception as error:
-        # ADK wraps a failed child node's error; the genai error is on `.error`.
-        cause = getattr(error, "error", error)
-        if not (isinstance(cause, errors.APIError) and cause.code in FALLBACK_CODES):
-            raise
-        log.warning(json.dumps({
-            "event": "fixer_fallback", "model": settings.fallback_model, "code": cause.code,
-        }))
-        return await ctx.run_node(fixer.fallback_fixer_agent, prompt), settings.fallback_model
-
-
 @node(rerun_on_resume=True)
 async def fix_pipeline(ctx: Context, node_input: str) -> FixResult:
     original = Path(node_input)
@@ -109,7 +91,7 @@ async def fix_pipeline(ctx: Context, node_input: str) -> FixResult:
     while rounds < MAX_ROUNDS and _rule_counts(audits):
         rounds += 1
         usage_before = Counter(fixer.TOKEN_USAGE[ctx.invocation_id])
-        raw, model = await _ask_fixer(ctx, build_fixer_prompt(copy_root, audits))
+        raw = await ctx.run_node(fixer.fixer_agent, build_fixer_prompt(copy_root, audits))
         failing_before = sum(_rule_counts(audits).values())
         result = await run_round(copy_root, audits, _parse_edits(raw))
         audits = result.audits
@@ -119,7 +101,7 @@ async def fix_pipeline(ctx: Context, node_input: str) -> FixResult:
         log.info(json.dumps({
             "event": "fix_round",
             "round": rounds,
-            "model": model,
+            "model": fixer.MODEL_USED.get(ctx.invocation_id, "none"),
             "prompt_tokens": tokens["prompt_tokens"],
             "output_tokens": tokens["output_tokens"],
             "total_tokens": tokens["total_tokens"],
