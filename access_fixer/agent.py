@@ -1,44 +1,32 @@
-"""The Access Fixer workflow: read the site location, fix it on a copy, report the results."""
+"""The Access Fixer workflow: get the site, fix it on a copy, report, ask, then open a PR."""
 
 import json
 import logging
-import re
 from collections import Counter
 from pathlib import Path
 
 from google.adk import Context, Event, Workflow
+from google.adk.events import RequestInput
 from google.adk.workflow import node
 from google.genai import types
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 
+from . import github_pr
 from .audit.axe_runner import audit_site
 from .audit.pages import find_pages
-from .audit.score import AuditSummary, summarize
+from .audit.score import summarize
 from .config import load_settings
 from .fix import fixer
 from .fix.edits import Edit, EditOutcome
 from .fix.loop import manual_checks, run_round
 from .fix.prompt import build_fixer_prompt
+from .fix.result import FixResult
 from .fix.workspace import make_working_copy
+from .source import Source, SourceError, clone_github_repo, local_source, parse_github_url
 
-GITHUB_URL = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+/?$")
 MAX_ROUNDS = 2
 
 log = logging.getLogger("access_fixer")
-
-
-class FixResult(BaseModel):
-    original_root: str
-    copy_root: str
-    before: AuditSummary
-    after: AuditSummary
-    rule_counts_before: dict[str, int]
-    rule_counts_after: dict[str, int]
-    accepted: list[EditOutcome]
-    rejected: list[EditOutcome]
-    manual_checks: list[str]
-    changed_files: list[str]
-    rounds: int
 
 
 def _message_text(node_input: types.Content | str) -> str:
@@ -48,16 +36,19 @@ def _message_text(node_input: types.Content | str) -> str:
 
 
 def read_source(node_input: types.Content | str) -> Event:
-    """Turn the user's message into a local folder to audit, or stop with a reason."""
+    """Turn the user's message into a folder to audit, or stop with a reason."""
     text = _message_text(node_input)
-    if GITHUB_URL.match(text):
-        return Event(route="stop", message="GitHub cloning arrives in Phase 3. Pass a local path.")
+    if repo := parse_github_url(text):
+        try:
+            return Event(route="ok", output=clone_github_repo(*repo))
+        except SourceError as error:
+            return Event(route="stop", message=str(error))
     if not load_settings().allow_local:
         return Event(route="stop", message="Send a GitHub HTTPS URL like https://github.com/owner/repo.")
     root = Path(text).expanduser().resolve()
     if not root.is_dir():
         return Event(route="stop", message=f"Not a folder: {text}")
-    return Event(route="ok", output=str(root))
+    return Event(route="ok", output=local_source(root))
 
 
 def _rule_counts(audits) -> Counter[str]:
@@ -79,8 +70,9 @@ def _parse_edits(raw: list | None) -> list[Edit]:
 
 
 @node(rerun_on_resume=True)
-async def fix_pipeline(ctx: Context, node_input: str) -> FixResult:
-    original = Path(node_input)
+async def fix_pipeline(ctx: Context, node_input: Source) -> FixResult:
+    source = Source.model_validate(node_input)
+    original = Path(source.root)
     copy_root = make_working_copy(original)
     audits = await audit_site(copy_root, find_pages(copy_root))
     before_audits = audits
@@ -112,7 +104,7 @@ async def fix_pipeline(ctx: Context, node_input: str) -> FixResult:
         }))
 
     return FixResult(
-        original_root=str(original),
+        source=source,
         copy_root=str(copy_root),
         before=summarize(before_audits),
         after=summarize(audits),
@@ -156,16 +148,54 @@ def format_report(result: FixResult) -> str:
 
 
 def report(node_input: FixResult) -> Event:
+    result = FixResult.model_validate(node_input)
+    can_open_pr = bool(result.changed_files and result.source.owner)
+    message = format_report(result)
+    if not result.source.owner:
+        message += "\n\nThis folder has no GitHub origin, so there is no pull request to open."
     return Event(
-        message=format_report(node_input),
-        output=node_input,
+        message=message,
+        output=result,
+        route="ask" if can_open_pr else "done",
         state={
-            "original_root": node_input.original_root,
-            "copy_root": node_input.copy_root,
-            "edits": [outcome.edit.model_dump() for outcome in node_input.accepted],
-            "changed_files": node_input.changed_files,
+            "fix_result": result.model_dump(mode="json"),
+            "original_root": result.source.root,
+            "copy_root": result.copy_root,
+            "edits": [outcome.edit.model_dump() for outcome in result.accepted],
+            "changed_files": result.changed_files,
         },
     )
+
+
+def ask_approval(node_input: FixResult):
+    result = FixResult.model_validate(node_input)
+    source = result.source
+    yield RequestInput(
+        message=(
+            f"Open a pull request on {source.owner}/{source.repo} (into {source.base_branch}) "
+            f"changing {len(result.changed_files)} file(s): {', '.join(result.changed_files)}? "
+            "Reply yes to open it. Anything else cancels and leaves GitHub untouched."
+        ),
+        payload={"changed_files": result.changed_files},
+    )
+
+
+def _approved(reply: object) -> bool:
+    if isinstance(reply, dict):
+        reply = reply.get("result", reply.get("approve", ""))
+    return str(reply).strip().lower() in {"yes", "y", "approve", "true"}
+
+
+async def open_pr(ctx: Context, node_input: object) -> Event:
+    if not _approved(node_input):
+        return Event(message="Cancelled. Nothing was changed on GitHub.")
+    result = FixResult.model_validate(ctx.state["fix_result"])
+    try:
+        url = await github_pr.open_pull_request(result, ctx)
+    except github_pr.PullRequestError as error:
+        return Event(message=f"Could not open the pull request: {error}")
+    log.info(json.dumps({"event": "pull_request", "url": url}))
+    return Event(message=f"Pull request opened: {url}", state={"pr_url": url})
 
 
 root_agent = Workflow(
@@ -174,5 +204,7 @@ root_agent = Workflow(
         ("START", read_source),
         (read_source, {"ok": fix_pipeline}),
         (fix_pipeline, report),
+        (report, {"ask": ask_approval}),
+        (ask_approval, open_pr),
     ],
 )
