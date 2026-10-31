@@ -23,6 +23,8 @@ from .fix.workspace import make_working_copy
 
 GITHUB_URL = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+/?$")
 MAX_ROUNDS = 2
+# 503: overloaded after all retries. 429: quota used up (free tier is 20 requests/day).
+FALLBACK_CODES = (429, 503)
 
 log = logging.getLogger("access_fixer")
 
@@ -79,16 +81,18 @@ def _parse_edits(raw: list | None) -> list[Edit]:
 
 
 async def _ask_fixer(ctx: Context, prompt: str) -> tuple[list | None, str]:
-    """Run the fixer; if the main model is still overloaded after retries, use the fallback."""
+    """Run the fixer; if the main model is overloaded or out of quota, use the fallback."""
     settings = load_settings()
     try:
         return await ctx.run_node(fixer.fixer_agent, prompt), settings.model
     except Exception as error:
         # ADK wraps a failed child node's error; the genai error is on `.error`.
         cause = getattr(error, "error", error)
-        if not (isinstance(cause, errors.ServerError) and cause.code == 503):
+        if not (isinstance(cause, errors.APIError) and cause.code in FALLBACK_CODES):
             raise
-        log.warning(json.dumps({"event": "fixer_fallback", "model": settings.fallback_model}))
+        log.warning(json.dumps({
+            "event": "fixer_fallback", "model": settings.fallback_model, "code": cause.code,
+        }))
         return await ctx.run_node(fixer.fallback_fixer_agent, prompt), settings.fallback_model
 
 

@@ -63,3 +63,15 @@ async def test_falls_back_when_main_model_is_overloaded(monkeypatch, caplog):
 
     assert "`image-alt` 1" in reply
     assert "fixer_fallback" in caplog.text
+
+
+def out_of_quota_fixer(node_input: str) -> list[dict]:
+    raise errors.ClientError(429, {"error": {"message": "quota exceeded"}}, None)
+
+
+async def test_falls_back_when_main_model_is_out_of_quota(monkeypatch):
+    monkeypatch.setenv("ACCESS_FIXER_ALLOW_LOCAL", "1")
+    monkeypatch.setattr(fixer, "fixer_agent", out_of_quota_fixer)
+    monkeypatch.setattr(fixer, "fallback_fixer_agent", fake_fixer)
+
+    assert "`image-alt` 1" in await _reply_text(str(FIXTURE))
