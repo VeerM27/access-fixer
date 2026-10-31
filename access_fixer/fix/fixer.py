@@ -59,10 +59,16 @@ def record_usage(callback_context: CallbackContext, llm_response: LlmResponse) -
     counter["total_tokens"] += usage.total_token_count or 0
 
 
-fixer_agent = Agent(
-    name="fixer",
-    model=Gemini(model=load_settings().model, retry_options=RETRY),
-    instruction=INSTRUCTION,
-    output_schema=list[Edit],
-    after_model_callback=record_usage,
-)
+def build_fixer_agent(name: str, model: str) -> Agent:
+    return Agent(
+        name=name,
+        model=Gemini(model=model, retry_options=RETRY),
+        instruction=INSTRUCTION,
+        output_schema=list[Edit],
+        after_model_callback=record_usage,
+    )
+
+
+_settings = load_settings()
+fixer_agent = build_fixer_agent("fixer", _settings.model)
+fallback_fixer_agent = build_fixer_agent("fixer_fallback", _settings.fallback_model)
