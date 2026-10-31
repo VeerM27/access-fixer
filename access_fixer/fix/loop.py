@@ -33,6 +33,42 @@ def _worse_rules(before: Counter[str], after: Counter[str]) -> list[str]:
     return [rule for rule, count in after.items() if count > before[rule]]
 
 
+def pages_affected_by(root: Path, file: str, pages: list[str]) -> list[str]:
+    """The pages an edit to `file` can change: the page itself, or every page linking a CSS file."""
+    if file.endswith(".css"):
+        return [page for page in pages if file in linked_css(root, page)]
+    return [file] if file in pages else []
+
+
+async def _retry_one_by_one(
+    root: Path, edits: list[Edit]
+) -> tuple[list[EditOutcome], list[EditOutcome]]:
+    """Re-apply edits in order, keeping each one that doesn't make an affected page worse."""
+    pages = find_pages(root)
+    good: list[EditOutcome] = []
+    bad: list[EditOutcome] = []
+    for edit in edits:
+        affected = pages_affected_by(root, edit.file, pages)
+        current = failing_counts(await audit_site(root, affected))
+        accepted, rejected, originals = apply_edits(root, [edit])
+        if rejected:
+            bad += rejected
+            continue
+        after = failing_counts(await audit_site(root, affected))
+        worse = {
+            page: rules
+            for page in affected
+            if (rules := _worse_rules(current.get(page, Counter()), after[page]))
+        }
+        if worse:
+            revert(root, originals, set(originals))
+            why = [f"made {', '.join(rules)} worse on {page}" for page, rules in worse.items()]
+            bad.append(EditOutcome(edit=edit, accepted=False, reason="; ".join(why)))
+        else:
+            good += accepted
+    return good, bad
+
+
 async def run_round(root: Path, audits: list[PageAudit], edits: list[Edit]) -> RoundResult:
     accepted, rejected, originals = apply_edits(root, edits)
     if not accepted:
@@ -42,26 +78,19 @@ async def run_round(root: Path, audits: list[PageAudit], edits: list[Edit]) -> R
     after = failing_counts(await audit_site(root, find_pages(root)))
     css_edited = {file for file in originals if file.endswith(".css")}
 
-    to_revert: dict[str, str] = {}  # file -> why
+    to_revert: set[str] = set()
     for page, counts in after.items():
-        worse = _worse_rules(before.get(page, Counter()), counts)
-        if not worse:
-            continue
-        why = f"made {', '.join(worse)} worse on {page}"
-        suspects = {page} | (set(linked_css(root, page)) & css_edited)
-        for file in suspects & originals.keys():
-            to_revert.setdefault(file, why)
+        if _worse_rules(before.get(page, Counter()), counts):
+            to_revert |= ({page} | (set(linked_css(root, page)) & css_edited)) & originals.keys()
 
     if to_revert:
-        revert(root, originals, set(to_revert))
-        still_accepted = []
+        revert(root, originals, to_revert)
+        kept, retried = [], []
         for outcome in accepted:
-            if outcome.edit.file in to_revert:
-                reason = to_revert[outcome.edit.file]
-                rejected.append(EditOutcome(edit=outcome.edit, accepted=False, reason=reason))
-            else:
-                still_accepted.append(outcome)
-        accepted = still_accepted
+            (retried if outcome.edit.file in to_revert else kept).append(outcome)
+        good, bad = await _retry_one_by_one(root, [o.edit for o in retried])
+        accepted = kept + good
+        rejected += bad
 
     return RoundResult(
         accepted=accepted, rejected=rejected, audits=await audit_site(root, find_pages(root))
